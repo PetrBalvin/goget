@@ -44,8 +44,6 @@ go install github.com/petrbalvin/goget@latest
 goget --version
 ```
 
----
-
 ### Manual Build
 ```bash
 git clone https://github.com/petrbalvin/goget.git
