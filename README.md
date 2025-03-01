@@ -34,9 +34,9 @@
 
 ---
 
-# Feature Comparison
+## Feature Comparison
 
-## Core Functionality
+### Core Functionality
 | Feature                | wget                          | goget (1.0.0-preview)        |
 |------------------------|-------------------------------|------------------------------|
 | **HTTP/HTTPS Support**  | ✅ Full support               | ✅ Full support               |
@@ -46,7 +46,7 @@
 | **Parallel Downloads**  | ✅ (`-N`/`--parallel`)        | ✅ (`-N=THREADS`)             |
 | **Resume Downloads**    | ✅ (`-c`)                     | ✅ (`-c`)                     |
 
-## Advanced Features
+### Advanced Features
 | Feature                | wget                          | goget (1.0.0-preview)        |
 |------------------------|-------------------------------|------------------------------|
 | **User-Agent Control**  | ✅ (`-U`)                     | ✅ (`-U`)                     |
@@ -58,7 +58,7 @@
 | **Link Conversion**     | ✅ (`-k`)                     | ❌ Not implemented            |
 | **Wildcard Support**    | ✅ (`-A`, `-R`, `-I`)         | ✅ (`-A`, `-R`, `-D`)         |
 
-## Performance & Security
+### Performance & Security
 | Feature                | wget                          | goget (1.0.0-preview)        |
 |------------------------|-------------------------------|------------------------------|
 | **HTTP/2 Support**      | ✅ (via libnghttp2)           | ✅ (native Go HTTP/2)        |
@@ -67,7 +67,7 @@
 | **Memory Usage**        | Moderate (C-based)           | Optimized (Go garbage collected) |
 | **Binary Size**         | ~1.5MB (Linux)               | ~8MB (Go runtime included)   |
 
-## User Experience
+### User Experience
 | Feature                | wget                          | goget (1.0.0-preview)        |
 |------------------------|-------------------------------|------------------------------|
 | **Output Control**      | ✅ (`-O`, `-o`, `-a`)         | ✅ (`-O`)                     |
@@ -75,7 +75,7 @@
 | **Progress Display**    | ✅ (built-in)                 | ❌ Not implemented            |
 | **Checksum Validation** | ✅ (`--checksum`)             | ❌ Not implemented            |
 
-## Implementation Details
+### Implementation Details
 | Feature                | wget                          | goget (1.0.0-preview)        |
 |------------------------|-------------------------------|------------------------------|
 | **Language**            | C (GNU Wget)                 | Go (modern, cross-platform)  |
