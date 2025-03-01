@@ -34,6 +34,57 @@
 
 ---
 
+# Feature Comparison
+
+## Core Functionality
+| Feature                | wget                          | goget (1.0.0-preview)        |
+|------------------------|-------------------------------|------------------------------|
+| **HTTP/HTTPS Support**  | ✅ Full support               | ✅ Full support               |
+| **FTP Support**         | ✅ Full support (incl. FTPS)  | ✅ Basic FTP support          |
+| **IPv6 Support**        | ✅ Automatic                  | ✅ Explicit (`-6` flag)       |
+| **Recursive Downloads** | ✅ Advanced (`-r`, `-l`, `-m`)| ✅ Basic HTML recursion        |
+| **Parallel Downloads**  | ✅ (`-N`/`--parallel`)        | ✅ (`-N=THREADS`)             |
+| **Resume Downloads**    | ✅ (`-c`)                     | ✅ (`-c`)                     |
+
+## Advanced Features
+| Feature                | wget                          | goget (1.0.0-preview)        |
+|------------------------|-------------------------------|------------------------------|
+| **User-Agent Control**  | ✅ (`-U`)                     | ✅ (`-U`)                     |
+| **Proxy Support**       | ✅ (`-e use_proxy=yes`)       | ✅ (`-proxy=URL`)             |
+| **Digest Auth**         | ✅ (`--auth-no-challenge`)    | ✅ (`-digest`)                |
+| **Cookies Persistence** | ✅ (`--save-cookies`)         | ✅ (`--cookies=FILE` in JSON) |
+| **POST Requests**       | ✅ (`--post-data`)            | ❌ Not implemented            |
+| **Spider Mode**         | ✅ (`--spider`)               | ❌ Not implemented            |
+| **Link Conversion**     | ✅ (`-k`)                     | ❌ Not implemented            |
+| **Wildcard Support**    | ✅ (`-A`, `-R`, `-I`)         | ✅ (`-A`, `-R`, `-D`)         |
+
+## Performance & Security
+| Feature                | wget                          | goget (1.0.0-preview)        |
+|------------------------|-------------------------------|------------------------------|
+| **HTTP/2 Support**      | ✅ (via libnghttp2)           | ✅ (native Go HTTP/2)        |
+| **Timeout Control**     | ✅ (`--timeout`)              | ✅ (`-timeout=30s`)           |
+| **Retry Mechanism**     | ✅ (`-t`/`--tries`)           | ✅ (`-tries=3`)               |
+| **Memory Usage**        | Moderate (C-based)           | Optimized (Go garbage collected) |
+| **Binary Size**         | ~1.5MB (Linux)               | ~8MB (Go runtime included)   |
+
+## User Experience
+| Feature                | wget                          | goget (1.0.0-preview)        |
+|------------------------|-------------------------------|------------------------------|
+| **Output Control**      | ✅ (`-O`, `-o`, `-a`)         | ✅ (`-O`)                     |
+| **Verbosity Levels**    | ✅ (`-v`, `-q`, `--verbose`)  | ✅ (`-v`, `-q`, `-log=LEVEL`) |
+| **Progress Display**    | ✅ (built-in)                 | ❌ Not implemented            |
+| **Checksum Validation** | ✅ (`--checksum`)             | ❌ Not implemented            |
+
+## Implementation Details
+| Feature                | wget                          | goget (1.0.0-preview)        |
+|------------------------|-------------------------------|------------------------------|
+| **Language**            | C (GNU Wget)                 | Go (modern, cross-platform)  |
+| **Dependencies**        | External (libssl, libidn)    | ✅ Zero external dependencies |
+| **License**             | GPL-3.0                       | BSD 3-Clause (more permissive) |
+| **HTML Parsing**        | Basic regex                  | ✅ Full HTML5 parser (`golang.org/x/net/html`) |
+
+---
+
 ## Installation
 ### Using Go
 ```bash
