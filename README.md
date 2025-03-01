@@ -42,6 +42,7 @@ go install github.com/petrbalvin/goget@latest
 
 # Verify installation
 goget --version
+```
 
 ---
 
@@ -51,6 +52,7 @@ git clone https://github.com/petrbalvin/goget.git
 cd goget
 go build -o goget main.go
 sudo mv goget /usr/local/bin/
+```
 
 ## Usage Examples
 ```bash
@@ -71,6 +73,7 @@ goget -r -A=pdf,txt -R=jpg,gif -url=http://example.com
 
 # Use cookies for session persistence
 goget --cookies=cookies.txt -url=https://secure.example.com
+```
 
 ---
 
