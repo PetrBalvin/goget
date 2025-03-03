@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha1"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -29,7 +31,7 @@ import (
 	"golang.org/x/net/html/atom"
 )
 
-const version = "1.0.0-preview"
+const version = "1.1.0"
 
 var (
 	urlFlag         string
@@ -57,7 +59,12 @@ var (
 	spanHosts       bool
 	relativeOnly    bool
 	cookiesFile     string
-	versionFlag     bool // Nová proměnná pro příznak --version
+	spiderMode      bool
+	mirrorMode      bool
+	convertLinks    bool
+	postData        string
+	checksum        string
+	versionFlag     bool // Oprava chybějící proměnné
 	downloadedFiles = make(map[string]bool)
 	downloadLock    sync.Mutex
 	baseHref        string
@@ -67,7 +74,7 @@ func init() {
 	flag.StringVar(&urlFlag, "url", "", "URL to download")
 	flag.StringVar(&output, "O", "", "Output file name")
 	flag.BoolVar(&preferIPv6, "6", false, "Use IPv6 only")
-	flag.BoolVar(&continueFlag, "c", false, "Continue getting a partially-downloaded file")
+	flag.BoolVar(&continueFlag, "c", false, "Continue partial downloads")
 	flag.BoolVar(&verbose, "v", false, "Verbose output")
 	flag.BoolVar(&quiet, "q", false, "Quiet mode")
 	flag.BoolVar(&recursive, "r", false, "Recursive download")
@@ -89,12 +96,16 @@ func init() {
 	flag.BoolVar(&spanHosts, "H", false, "Span hosts")
 	flag.BoolVar(&relativeOnly, "L", false, "Follow relative links only")
 	flag.StringVar(&cookiesFile, "cookies", "", "Cookies file")
-	flag.BoolVar(&versionFlag, "version", false, "Show version") // Registrace příznaku --version
+	flag.BoolVar(&spiderMode, "spider", false, "Check URL existence without downloading")
+	flag.BoolVar(&mirrorMode, "m", false, "Mirror mode with timestamp preservation")
+	flag.BoolVar(&convertLinks, "k", false, "Convert links for local viewing")
+	flag.StringVar(&postData, "post-data", "", "POST data to send")
+	flag.StringVar(&checksum, "checksum", "", "Checksum verification (md5:hash or sha1:hash)")
+	flag.BoolVar(&versionFlag, "version", false, "Show version") // Oprava registrace příznaku
 	flag.Parse()
 }
 
 func main() {
-	// Kontrola příznaku --version
 	if versionFlag {
 		fmt.Printf("goget version %s\n", version)
 		os.Exit(0)
@@ -192,7 +203,7 @@ func download(parsedURL *url.URL, outputFile string, depth int) error {
 	switch parsedURL.Scheme {
 	case "http", "https":
 		return downloadHTTP(parsedURL, outputFile, depth)
-	case "ftp":
+	case "ftp", "ftps":
 		return downloadFTP(parsedURL)
 	default:
 		return fmt.Errorf("unsupported protocol: %s", parsedURL.Scheme)
@@ -218,6 +229,7 @@ func createHTTPClient() *http.Client {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: false},
 	}
 
 	jar, _ := cookiejar.New(nil)
@@ -237,8 +249,24 @@ func downloadHTTP(parsedURL *url.URL, outputFile string, depth int) error {
 
 	for i := 0; i < retryCount; i++ {
 		err := func() error {
-			req, _ := http.NewRequest("GET", parsedURL.String(), nil)
+			method := "GET"
+			var body io.Reader
+
+			if spiderMode {
+				method = "HEAD"
+			}
+
+			if postData != "" {
+				method = "POST"
+				body = strings.NewReader(postData)
+			}
+
+			req, _ := http.NewRequest(method, parsedURL.String(), body)
 			req.Header.Set("User-Agent", userAgent)
+
+			if postData != "" {
+				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			}
 
 			if httpUser != "" || digestAuth {
 				if digestAuth {
@@ -257,13 +285,22 @@ func downloadHTTP(parsedURL *url.URL, outputFile string, depth int) error {
 			}
 			defer resp.Body.Close()
 
+			if spiderMode {
+				fmt.Printf("%d %s\n", resp.StatusCode, resp.Status)
+				return nil
+			}
+
 			if resp.StatusCode != 200 && resp.StatusCode != 206 {
 				return fmt.Errorf("server returned %d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
 			}
 
-			finalOutput := outputFile
-			if finalOutput == "" {
-				finalOutput = generateOutputFileName(parsedURL)
+			finalOutput := generateOutputPath(parsedURL)
+			if outputFile != "" {
+				finalOutput = outputFile
+			}
+
+			if mirrorMode {
+				os.MkdirAll(filepath.Dir(finalOutput), 0755)
 			}
 
 			file, err := os.OpenFile(finalOutput, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
@@ -283,6 +320,11 @@ func downloadHTTP(parsedURL *url.URL, outputFile string, depth int) error {
 			chunkSize := contentLength / int64(parallel)
 			start := int64(0)
 			errChan := make(chan error, parallel)
+
+			doneChan := make(chan struct{})
+			if !quiet && !spiderMode {
+				go printProgress(doneChan, contentLength, finalOutput)
+			}
 
 			for i := 0; i < parallel; i++ {
 				end := start + chunkSize
@@ -305,6 +347,7 @@ func downloadHTTP(parsedURL *url.URL, outputFile string, depth int) error {
 			go func() {
 				wg.Wait()
 				close(errChan)
+				close(doneChan)
 			}()
 
 			for err := range errChan {
@@ -313,7 +356,26 @@ func downloadHTTP(parsedURL *url.URL, outputFile string, depth int) error {
 				}
 			}
 
-			if recursive {
+			if convertLinks && !spiderMode {
+				content, _ := os.ReadFile(finalOutput)
+				doc, _ := html.Parse(bytes.NewReader(content))
+				rewriteLinks(doc, parsedURL)
+				os.WriteFile(finalOutput, []byte(renderHTML(doc)), 0644)
+			}
+
+			if mirrorMode {
+				modTime, _ := time.Parse(time.RFC1123, resp.Header.Get("Last-Modified"))
+				os.Chtimes(finalOutput, modTime, modTime)
+			}
+
+			if checksum != "" {
+				err := verifyChecksum(finalOutput)
+				if err != nil {
+					return err
+				}
+			}
+
+			if recursive && !spiderMode {
 				return downloadRecursive(parsedURL, finalOutput, depth-1, client)
 			}
 
@@ -330,61 +392,73 @@ func downloadHTTP(parsedURL *url.URL, outputFile string, depth int) error {
 	return lastErr
 }
 
-func generateOutputFileName(parsedURL *url.URL) string {
+func generateOutputPath(parsedURL *url.URL) string {
 	path := parsedURL.Path
 	if path == "" || path == "/" {
-		return "index.html"
+		path = "/index.html"
 	}
 
-	base := filepath.Base(path)
-	if base == "" || base == "." || base == "/" {
-		return "index.html"
+	if mirrorMode {
+		host := parsedURL.Hostname()
+		if parsedURL.Port() != "" {
+			host += ":" + parsedURL.Port()
+		}
+		return filepath.Join("downloads", host, path)
 	}
 
-	return base
+	return filepath.Base(path)
 }
 
-func handleDigestAuth(client *http.Client, req *http.Request) error {
-	resp, err := client.Do(req)
+func printProgress(doneChan chan struct{}, total int64, filename string) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			fileInfo, _ := os.Stat(filename)
+			percent := (fileInfo.Size() * 100) / total
+			fmt.Printf("\rDownloading %s: %d%% (%d/%d bytes)",
+				filepath.Base(filename), percent, fileInfo.Size(), total)
+		case <-doneChan:
+			fmt.Printf("\rDownload complete: %s\n", filename)
+			return
+		}
+	}
+}
+
+func verifyChecksum(filename string) error {
+	parts := strings.SplitN(checksum, ":", 2)
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid checksum format")
+	}
+
+	file, err := os.Open(filename) // Oprava chybějícího souboru
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer file.Close()
 
-	if resp.StatusCode != 401 {
-		return nil
+	var hasher interface {
+		io.Writer
+		Sum([]byte) []byte
 	}
 
-	authHeader := resp.Header.Get("WWW-Authenticate")
-	params := parseDigestParams(authHeader)
-	ha1 := md5.Sum([]byte(fmt.Sprintf("%s:%s:%s", httpUser, params["realm"], httpPass)))
-	ha2 := md5.Sum([]byte(fmt.Sprintf("%s:%s", req.Method, req.URL.Path)))
-	nonceCount := "00000001"
-	cnonceBytes := make([]byte, 8)
-	rand.Read(cnonceBytes)
-	cnonce := hex.EncodeToString(cnonceBytes)
-	response := md5.Sum([]byte(fmt.Sprintf("%x:%s:%s:%s:%s:%x", ha1, params["nonce"], nonceCount, cnonce, "auth", ha2)))
+	switch parts[0] {
+	case "md5":
+		hasher = md5.New()
+	case "sha1":
+		hasher = sha1.New()
+	default:
+		return fmt.Errorf("unsupported hash type")
+	}
 
-	authValue := fmt.Sprintf(`Digest username="%s", realm="%s", nonce="%s", uri="%s", qop=auth, nc=%s, cnonce="%s", response="%x"`,
-		httpUser, params["realm"], params["nonce"], req.URL.Path, nonceCount, cnonce, response)
-
-	req.Header.Set("Authorization", authValue)
+	io.Copy(hasher, file)
+	actual := hex.EncodeToString(hasher.(interface{ Sum([]byte) []byte }).Sum(nil))
+	if actual != parts[1] {
+		return fmt.Errorf("checksum mismatch: expected %s, got %s", parts[1], actual)
+	}
 	return nil
-}
-
-func parseDigestParams(header string) map[string]string {
-	params := make(map[string]string)
-	header = strings.TrimPrefix(header, "Digest ")
-	parts := strings.Split(header, ",")
-	for _, part := range parts {
-		kv := strings.SplitN(part, "=", 2)
-		if len(kv) == 2 {
-			key := strings.TrimSpace(kv[0])
-			value := strings.Trim(kv[1], `"`)
-			params[key] = value
-		}
-	}
-	return params
 }
 
 func downloadPart(url string, file *os.File, start, end int64, client *http.Client) error {
@@ -573,7 +647,144 @@ func shouldDownload(absURL, baseURL *url.URL, allowedDomains, acceptExts, reject
 	return true
 }
 
+func handleDigestAuth(client *http.Client, req *http.Request) error {
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 401 {
+		return nil
+	}
+
+	authHeader := resp.Header.Get("WWW-Authenticate")
+	params := parseDigestParams(authHeader)
+	ha1 := md5.Sum([]byte(fmt.Sprintf("%s:%s:%s", httpUser, params["realm"], httpPass)))
+	ha2 := md5.Sum([]byte(fmt.Sprintf("%s:%s", req.Method, req.URL.Path)))
+	nonceCount := "00000001"
+	cnonceBytes := make([]byte, 8)
+	rand.Read(cnonceBytes)
+	cnonce := hex.EncodeToString(cnonceBytes)
+	response := md5.Sum([]byte(fmt.Sprintf("%x:%s:%s:%s:%s:%x", ha1, params["nonce"], nonceCount, cnonce, "auth", ha2)))
+
+	authValue := fmt.Sprintf(`Digest username="%s", realm="%s", nonce="%s", uri="%s", qop=auth, nc=%s, cnonce="%s", response="%x"`,
+		httpUser, params["realm"], params["nonce"], req.URL.Path, nonceCount, cnonce, response)
+
+	req.Header.Set("Authorization", authValue)
+	return nil
+}
+
+func parseDigestParams(header string) map[string]string {
+	params := make(map[string]string)
+	header = strings.TrimPrefix(header, "Digest ")
+	parts := strings.Split(header, ",")
+	for _, part := range parts {
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) == 2 {
+			key := strings.TrimSpace(kv[0])
+			value := strings.Trim(kv[1], `"`)
+			params[key] = value
+		}
+	}
+	return params
+}
+
 func downloadFTP(parsedURL *url.URL) error {
+	scheme := parsedURL.Scheme
+	if scheme == "ftps" {
+		config := &tls.Config{
+			InsecureSkipVerify: false,
+			ServerName:         parsedURL.Hostname(),
+		}
+		conn, err := tls.Dial("tcp", parsedURL.Host+":21", config)
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+
+		tp := textproto.NewConn(conn)
+		defer tp.Close()
+
+		code, msg, _ := tp.ReadResponse(220)
+		if code != 220 {
+			return fmt.Errorf("FTPS connection failed: %s", msg)
+		}
+
+		user := ftpUser
+		if user == "" {
+			user = "anonymous"
+		}
+		pass := ftpPass
+		if user == "anonymous" && pass == "" {
+			pass = "goget@example.com"
+		}
+
+		tp.PrintfLine("USER %s", user)
+		code, _, _ = tp.ReadResponse(331)
+		if code != 331 && code != 230 {
+			return fmt.Errorf("FTPS login failed")
+		}
+
+		tp.PrintfLine("PASS %s", pass)
+		code, _, _ = tp.ReadResponse(230)
+		if code != 230 {
+			return fmt.Errorf("FTPS authentication failed")
+		}
+
+		tp.PrintfLine("TYPE I")
+		code, _, _ = tp.ReadResponse(200)
+		if code != 200 {
+			return fmt.Errorf("FTPS TYPE I failed")
+		}
+
+		tp.PrintfLine("PASV")
+		code, msg, _ = tp.ReadResponse(227)
+		if code != 227 {
+			return fmt.Errorf("FTPS PASV failed")
+		}
+
+		dataConn, err := parsePASV(msg)
+		if err != nil {
+			return err
+		}
+
+		tp.PrintfLine("LIST %s", parsedURL.Path)
+		code, _, _ = tp.ReadResponse(150)
+		if code != 150 {
+			return fmt.Errorf("FTPS LIST failed")
+		}
+
+		reader := bufio.NewReader(dataConn)
+		scanner := bufio.NewScanner(reader)
+		var files []string
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "d") {
+				dirName := strings.Fields(line)[8]
+				files = append(files, dirName+"/")
+			} else {
+				fileName := strings.Fields(line)[8]
+				files = append(files, fileName)
+			}
+		}
+
+		dataConn.Close()
+		tp.ReadResponse(226)
+
+		for _, file := range files {
+			fileURL := *parsedURL
+			fileURL.Path = filepath.Join(fileURL.Path, file)
+			err := download(&fileURL, "", maxDepth-1)
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}
+
 	conn, err := net.Dial("tcp", parsedURL.Host+":21")
 	if err != nil {
 		return err
@@ -677,4 +888,31 @@ func parsePASV(msg string) (net.Conn, error) {
 func atoi(s string) int {
 	i, _ := strconv.Atoi(s)
 	return i
+}
+
+func rewriteLinks(doc *html.Node, baseUrl *url.URL) {
+	var f func(*html.Node)
+	f = func(n *html.Node) {
+		if n.Type == html.ElementNode {
+			switch n.DataAtom {
+			case atom.A, atom.Link, atom.Script, atom.Img:
+				for i, attr := range n.Attr {
+					if attr.Key == "href" || attr.Key == "src" {
+						absURL := resolveURL(baseUrl, attr.Val)
+						n.Attr[i].Val = absURL.String()
+					}
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			f(c)
+		}
+	}
+	f(doc)
+}
+
+func renderHTML(n *html.Node) string {
+	var buf bytes.Buffer
+	html.Render(&buf, n)
+	return buf.String()
 }
