@@ -2,8 +2,8 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
+	"context"
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha1"
@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
@@ -27,11 +28,13 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/crypto/ssh/terminal"
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
+	"golang.org/x/time/rate"
 )
 
-const version = "1.1.0"
+const version = "1.2.0"
 
 var (
 	urlFlag         string
@@ -63,8 +66,13 @@ var (
 	mirrorMode      bool
 	convertLinks    bool
 	postData        string
+	postFile        string
 	checksum        string
-	versionFlag     bool // Oprava chybějící proměnné
+	http3Enabled    bool
+	mimeType        string
+	versionFlag     bool
+	limitRate       string
+	rateLimiter     *rate.Limiter
 	downloadedFiles = make(map[string]bool)
 	downloadLock    sync.Mutex
 	baseHref        string
@@ -97,11 +105,15 @@ func init() {
 	flag.BoolVar(&relativeOnly, "L", false, "Follow relative links only")
 	flag.StringVar(&cookiesFile, "cookies", "", "Cookies file")
 	flag.BoolVar(&spiderMode, "spider", false, "Check URL existence without downloading")
-	flag.BoolVar(&mirrorMode, "m", false, "Mirror mode with timestamp preservation")
+	flag.BoolVar(&mirrorMode, "m", false, "Mirror mode with directory structure")
 	flag.BoolVar(&convertLinks, "k", false, "Convert links for local viewing")
 	flag.StringVar(&postData, "post-data", "", "POST data to send")
+	flag.StringVar(&postFile, "post-file", "", "File to upload via POST")
 	flag.StringVar(&checksum, "checksum", "", "Checksum verification (md5:hash or sha1:hash)")
-	flag.BoolVar(&versionFlag, "version", false, "Show version") // Oprava registrace příznaku
+	flag.BoolVar(&http3Enabled, "http3", false, "Enable experimental HTTP/3 support")
+	flag.StringVar(&mimeType, "mime-type", "", "Filter by MIME type (e.g., 'image/jpeg')")
+	flag.BoolVar(&versionFlag, "version", false, "Show version")
+	flag.StringVar(&limitRate, "limit-rate", "", "Maximum download rate (e.g., 100k, 1M)")
 	flag.Parse()
 }
 
@@ -113,6 +125,17 @@ func main() {
 
 	if urlFlag == "" {
 		log.Fatal("Error: URL is required")
+	}
+
+	if limitRate != "" {
+		bytesPerSecond, err := parseRateLimit(limitRate)
+		if err != nil {
+			log.Fatalf("Error parsing rate limit: %v", err)
+		}
+		if bytesPerSecond <= 0 {
+			log.Fatal("Rate limit must be a positive value")
+		}
+		rateLimiter = rate.NewLimiter(rate.Limit(bytesPerSecond), int(bytesPerSecond))
 	}
 
 	setupLogging()
@@ -128,6 +151,58 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+}
+
+func parseRateLimit(s string) (int64, error) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return 0, nil
+	}
+
+	var multiplier int64 = 1
+	suffixes := map[string]int64{
+		"k": 1024,
+		"m": 1024 * 1024,
+		"g": 1024 * 1024 * 1024,
+	}
+
+	for suffix, mult := range suffixes {
+		if strings.HasSuffix(s, suffix) {
+			multiplier = mult
+			s = strings.TrimSuffix(s, suffix)
+			break
+		}
+	}
+
+	bytes, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid rate format: %v", err)
+	}
+
+	return bytes * multiplier, nil
+}
+
+type rateLimitedReader struct {
+	reader  io.Reader
+	limiter *rate.Limiter
+}
+
+func newRateLimitedReader(r io.Reader, l *rate.Limiter) *rateLimitedReader {
+	return &rateLimitedReader{
+		reader:  r,
+		limiter: l,
+	}
+}
+
+func (r *rateLimitedReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 && r.limiter != nil {
+		ctx := context.Background()
+		if err := r.limiter.WaitN(ctx, n); err != nil {
+			return 0, err
+		}
+	}
+	return n, err
 }
 
 func setupLogging() {
@@ -229,18 +304,23 @@ func createHTTPClient() *http.Client {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		TLSClientConfig:       &tls.Config{InsecureSkipVerify: false},
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: false,
+			NextProtos:         []string{"h2", "http/1.1"},
+		},
+	}
+
+	if http3Enabled {
+		transport.TLSClientConfig.NextProtos = []string{"h3"}
 	}
 
 	jar, _ := cookiejar.New(nil)
-	client := &http.Client{
+	return &http.Client{
 		Transport:     transport,
 		Jar:           jar,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse },
 		Timeout:       timeout,
 	}
-
-	return client
 }
 
 func downloadHTTP(parsedURL *url.URL, outputFile string, depth int) error {
@@ -256,130 +336,86 @@ func downloadHTTP(parsedURL *url.URL, outputFile string, depth int) error {
 				method = "HEAD"
 			}
 
-			if postData != "" {
+			if postData != "" || postFile != "" {
 				method = "POST"
-				body = strings.NewReader(postData)
-			}
+				var buf bytes.Buffer
+				writer := multipart.NewWriter(&buf)
 
-			req, _ := http.NewRequest(method, parsedURL.String(), body)
-			req.Header.Set("User-Agent", userAgent)
+				if postData != "" {
+					for _, param := range strings.Split(postData, "&") {
+						kv := strings.SplitN(param, "=", 2)
+						if len(kv) == 2 {
+							writer.WriteField(kv[0], kv[1])
+						}
+					}
+				}
 
-			if postData != "" {
-				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-			}
-
-			if httpUser != "" || digestAuth {
-				if digestAuth {
-					err := handleDigestAuth(client, req)
+				if postFile != "" {
+					file, err := os.Open(postFile)
 					if err != nil {
 						return err
 					}
-				} else {
+					defer file.Close()
+
+					part, err := writer.CreateFormFile("file", filepath.Base(postFile))
+					if err != nil {
+						return err
+					}
+					_, err = io.Copy(part, file)
+					if err != nil {
+						return err
+					}
+				}
+
+				writer.Close()
+				body = &buf
+
+				req, err := http.NewRequest(method, parsedURL.String(), body)
+				if err != nil {
+					return err
+				}
+
+				req.Header.Set("User-Agent", userAgent)
+				req.Header.Set("Content-Type", writer.FormDataContentType())
+
+				if httpUser != "" || digestAuth {
+					if digestAuth {
+						authErr := handleDigestAuth(client, req)
+						if authErr != nil {
+							return authErr
+						}
+					} else {
+						req.SetBasicAuth(httpUser, httpPass)
+					}
+				}
+
+				resp, err := client.Do(req)
+				if err != nil {
+					return err
+				}
+				defer resp.Body.Close()
+
+				return processResponse(resp, parsedURL, outputFile, depth, client)
+			} else {
+				req, err := http.NewRequest(method, parsedURL.String(), body)
+				if err != nil {
+					return err
+				}
+
+				req.Header.Set("User-Agent", userAgent)
+
+				if httpUser != "" {
 					req.SetBasicAuth(httpUser, httpPass)
 				}
-			}
 
-			resp, err := client.Do(req)
-			if err != nil {
-				return err
-			}
-			defer resp.Body.Close()
-
-			if spiderMode {
-				fmt.Printf("%d %s\n", resp.StatusCode, resp.Status)
-				return nil
-			}
-
-			if resp.StatusCode != 200 && resp.StatusCode != 206 {
-				return fmt.Errorf("server returned %d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
-			}
-
-			finalOutput := generateOutputPath(parsedURL)
-			if outputFile != "" {
-				finalOutput = outputFile
-			}
-
-			if mirrorMode {
-				os.MkdirAll(filepath.Dir(finalOutput), 0755)
-			}
-
-			file, err := os.OpenFile(finalOutput, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-			if err != nil {
-				return err
-			}
-			defer file.Close()
-
-			contentLength := resp.ContentLength
-			if continueFlag {
-				fileInfo, _ := file.Stat()
-				contentLength -= fileInfo.Size()
-				req.Header.Set("Range", fmt.Sprintf("bytes=%d-", fileInfo.Size()))
-			}
-
-			var wg sync.WaitGroup
-			chunkSize := contentLength / int64(parallel)
-			start := int64(0)
-			errChan := make(chan error, parallel)
-
-			doneChan := make(chan struct{})
-			if !quiet && !spiderMode {
-				go printProgress(doneChan, contentLength, finalOutput)
-			}
-
-			for i := 0; i < parallel; i++ {
-				end := start + chunkSize
-				if i == parallel-1 {
-					end = contentLength
-				}
-
-				wg.Add(1)
-				go func(start, end int64) {
-					defer wg.Done()
-					err := downloadPart(parsedURL.String(), file, start, end, client)
-					if err != nil {
-						errChan <- err
-					}
-				}(start, end)
-
-				start = end + 1
-			}
-
-			go func() {
-				wg.Wait()
-				close(errChan)
-				close(doneChan)
-			}()
-
-			for err := range errChan {
+				resp, err := client.Do(req)
 				if err != nil {
 					return err
 				}
-			}
+				defer resp.Body.Close()
 
-			if convertLinks && !spiderMode {
-				content, _ := os.ReadFile(finalOutput)
-				doc, _ := html.Parse(bytes.NewReader(content))
-				rewriteLinks(doc, parsedURL)
-				os.WriteFile(finalOutput, []byte(renderHTML(doc)), 0644)
+				return processResponse(resp, parsedURL, outputFile, depth, client)
 			}
-
-			if mirrorMode {
-				modTime, _ := time.Parse(time.RFC1123, resp.Header.Get("Last-Modified"))
-				os.Chtimes(finalOutput, modTime, modTime)
-			}
-
-			if checksum != "" {
-				err := verifyChecksum(finalOutput)
-				if err != nil {
-					return err
-				}
-			}
-
-			if recursive && !spiderMode {
-				return downloadRecursive(parsedURL, finalOutput, depth-1, client)
-			}
-
-			return nil
 		}()
 
 		if err == nil {
@@ -392,37 +428,145 @@ func downloadHTTP(parsedURL *url.URL, outputFile string, depth int) error {
 	return lastErr
 }
 
-func generateOutputPath(parsedURL *url.URL) string {
-	path := parsedURL.Path
-	if path == "" || path == "/" {
-		path = "/index.html"
+func processResponse(resp *http.Response, parsedURL *url.URL, outputFile string, depth int, client *http.Client) error {
+	if spiderMode {
+		fmt.Printf("%d %s\n", resp.StatusCode, resp.Status)
+		return nil
+	}
+
+	if mimeType != "" {
+		contentType := resp.Header.Get("Content-Type")
+		if !strings.HasPrefix(contentType, mimeType) {
+			return fmt.Errorf("MIME type mismatch: %s", contentType)
+		}
+	}
+
+	if resp.StatusCode != 200 && resp.StatusCode != 206 {
+		return fmt.Errorf("server returned %d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+	}
+
+	finalOutput := generateOutputPath(parsedURL)
+	if outputFile != "" {
+		finalOutput = outputFile
 	}
 
 	if mirrorMode {
-		host := parsedURL.Hostname()
-		if parsedURL.Port() != "" {
-			host += ":" + parsedURL.Port()
-		}
-		return filepath.Join("downloads", host, path)
+		os.MkdirAll(filepath.Dir(finalOutput), 0755)
 	}
 
-	return filepath.Base(path)
+	file, err := os.OpenFile(finalOutput, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	contentLength := resp.ContentLength
+	if continueFlag {
+		fileInfo, _ := file.Stat()
+		contentLength -= fileInfo.Size()
+		resp.Request.Header.Set("Range", fmt.Sprintf("bytes=%d-", fileInfo.Size()))
+	}
+
+	var wg sync.WaitGroup
+	chunkSize := contentLength / int64(parallel)
+	start := int64(0)
+	errChan := make(chan error, parallel)
+	doneChan := make(chan struct{})
+
+	if !quiet && !spiderMode {
+		go printProgress(doneChan, contentLength, finalOutput)
+	}
+
+	for i := 0; i < parallel; i++ {
+		end := start + chunkSize
+		if i == parallel-1 {
+			end = contentLength
+		}
+
+		wg.Add(1)
+		go func(start, end int64) {
+			defer wg.Done()
+			err := downloadPart(parsedURL.String(), file, start, end, client)
+			if err != nil {
+				errChan <- err
+			}
+		}(start, end)
+
+		start = end + 1
+	}
+
+	go func() {
+		wg.Wait()
+		close(errChan)
+		close(doneChan)
+	}()
+
+	for err := range errChan {
+		if err != nil {
+			return err
+		}
+	}
+
+	if convertLinks && !spiderMode {
+		content, _ := os.ReadFile(finalOutput)
+		doc, _ := html.Parse(bytes.NewReader(content))
+		rewriteLinks(doc, parsedURL)
+		os.WriteFile(finalOutput, []byte(renderHTML(doc)), 0644)
+	}
+
+	if mirrorMode {
+		modTime, _ := time.Parse(time.RFC1123, resp.Header.Get("Last-Modified"))
+		os.Chtimes(finalOutput, modTime, modTime)
+	}
+
+	if checksum != "" {
+		err := verifyChecksum(finalOutput)
+		if err != nil {
+			return err
+		}
+	}
+
+	if recursive && !spiderMode {
+		return downloadRecursive(parsedURL, finalOutput, depth-1, client)
+	}
+
+	return nil
 }
 
 func printProgress(doneChan chan struct{}, total int64, filename string) {
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
+	start := time.Now()
+	width, _, _ := terminal.GetSize(0)
 
 	for {
 		select {
-		case <-ticker.C:
-			fileInfo, _ := os.Stat(filename)
-			percent := (fileInfo.Size() * 100) / total
-			fmt.Printf("\rDownloading %s: %d%% (%d/%d bytes)",
-				filepath.Base(filename), percent, fileInfo.Size(), total)
 		case <-doneChan:
-			fmt.Printf("\rDownload complete: %s\n", filename)
+			fmt.Printf("\r%s\n", strings.Repeat(" ", width))
 			return
+		default:
+			fileInfo, _ := os.Stat(filename)
+			downloaded := fileInfo.Size()
+			percent := float64(downloaded) / float64(total) * 100
+			speed := float64(downloaded) / time.Since(start).Seconds() / 1e6
+
+			if speed == 0 {
+				continue
+			}
+
+			etaSecs := float64(total-downloaded) / (speed * 1e6)
+			eta := time.Duration(etaSecs) * time.Second
+
+			barWidth := width - 50
+			progress := int(percent / 100 * float64(barWidth))
+			bar := fmt.Sprintf("[%s%s] %.1f%% | %.2f MB/s | ETA: %s",
+				strings.Repeat("=", progress),
+				strings.Repeat(" ", barWidth-progress),
+				percent,
+				speed,
+				eta.Truncate(time.Second),
+			)
+
+			fmt.Printf("\r%s", bar)
+			time.Sleep(200 * time.Millisecond)
 		}
 	}
 }
@@ -433,7 +577,7 @@ func verifyChecksum(filename string) error {
 		return fmt.Errorf("invalid checksum format")
 	}
 
-	file, err := os.Open(filename) // Oprava chybějícího souboru
+	file, err := os.Open(filename)
 	if err != nil {
 		return err
 	}
@@ -462,7 +606,10 @@ func verifyChecksum(filename string) error {
 }
 
 func downloadPart(url string, file *os.File, start, end int64, client *http.Client) error {
-	req, _ := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
+	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
 
 	resp, err := client.Do(req)
@@ -487,7 +634,6 @@ func downloadRecursive(baseUrl *url.URL, outputFile string, depth int, client *h
 		return err
 	}
 
-	var baseHref string
 	var f func(*html.Node)
 	f = func(n *html.Node) {
 		if n.Type == html.ElementNode && n.DataAtom == atom.Base {
@@ -533,14 +679,14 @@ func downloadRecursive(baseUrl *url.URL, outputFile string, depth int, client *h
 		wg.Add(1)
 		go func(urlStr string) {
 			defer wg.Done()
-			parsedURL, err := url.Parse(urlStr)
-			if err != nil {
-				errChan <- err
+			parsedURL, parseErr := url.Parse(urlStr)
+			if parseErr != nil {
+				errChan <- parseErr
 				return
 			}
-			err = download(parsedURL, "", depth-1)
-			if err != nil {
-				errChan <- err
+			downloadErr := download(parsedURL, "", depth-1)
+			if downloadErr != nil {
+				errChan <- downloadErr
 			}
 		}(absURL.String())
 	}
@@ -690,113 +836,65 @@ func parseDigestParams(header string) map[string]string {
 	return params
 }
 
+// --- FTP Wildcard Implementation Start ---
 func downloadFTP(parsedURL *url.URL) error {
-	scheme := parsedURL.Scheme
-	if scheme == "ftps" {
-		config := &tls.Config{
-			InsecureSkipVerify: false,
-			ServerName:         parsedURL.Hostname(),
-		}
-		conn, err := tls.Dial("tcp", parsedURL.Host+":21", config)
-		if err != nil {
-			return err
-		}
-		defer conn.Close()
-
-		tp := textproto.NewConn(conn)
-		defer tp.Close()
-
-		code, msg, _ := tp.ReadResponse(220)
-		if code != 220 {
-			return fmt.Errorf("FTPS connection failed: %s", msg)
-		}
-
-		user := ftpUser
-		if user == "" {
-			user = "anonymous"
-		}
-		pass := ftpPass
-		if user == "anonymous" && pass == "" {
-			pass = "goget@example.com"
-		}
-
-		tp.PrintfLine("USER %s", user)
-		code, _, _ = tp.ReadResponse(331)
-		if code != 331 && code != 230 {
-			return fmt.Errorf("FTPS login failed")
-		}
-
-		tp.PrintfLine("PASS %s", pass)
-		code, _, _ = tp.ReadResponse(230)
-		if code != 230 {
-			return fmt.Errorf("FTPS authentication failed")
-		}
-
-		tp.PrintfLine("TYPE I")
-		code, _, _ = tp.ReadResponse(200)
-		if code != 200 {
-			return fmt.Errorf("FTPS TYPE I failed")
-		}
-
-		tp.PrintfLine("PASV")
-		code, msg, _ = tp.ReadResponse(227)
-		if code != 227 {
-			return fmt.Errorf("FTPS PASV failed")
-		}
-
-		dataConn, err := parsePASV(msg)
-		if err != nil {
-			return err
-		}
-
-		tp.PrintfLine("LIST %s", parsedURL.Path)
-		code, _, _ = tp.ReadResponse(150)
-		if code != 150 {
-			return fmt.Errorf("FTPS LIST failed")
-		}
-
-		reader := bufio.NewReader(dataConn)
-		scanner := bufio.NewScanner(reader)
-		var files []string
-
-		for scanner.Scan() {
-			line := scanner.Text()
-			if strings.HasPrefix(line, "d") {
-				dirName := strings.Fields(line)[8]
-				files = append(files, dirName+"/")
-			} else {
-				fileName := strings.Fields(line)[8]
-				files = append(files, fileName)
-			}
-		}
-
-		dataConn.Close()
-		tp.ReadResponse(226)
-
-		for _, file := range files {
-			fileURL := *parsedURL
-			fileURL.Path = filepath.Join(fileURL.Path, file)
-			err := download(&fileURL, "", maxDepth-1)
-			if err != nil {
-				return err
-			}
-		}
-
-		return nil
+	path := parsedURL.Path
+	if strings.ContainsAny(path, "*?") {
+		return downloadFTPWildcard(parsedURL)
 	}
+	return downloadSingleFTPFile(parsedURL)
+}
 
-	conn, err := net.Dial("tcp", parsedURL.Host+":21")
+func downloadFTPWildcard(parsedURL *url.URL) error {
+	tp, err := ftpConnect(parsedURL)
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
-
-	tp := textproto.NewConn(conn)
 	defer tp.Close()
 
-	code, msg, _ := tp.ReadResponse(220)
-	if code != 220 {
-		return fmt.Errorf("FTP connection failed: %s", msg)
+	files, err := listFTPFiles(tp, parsedURL.Path)
+	if err != nil {
+		return err
+	}
+
+	if len(files) == 0 {
+		return fmt.Errorf("no files matching pattern: %s", parsedURL.Path)
+	}
+
+	for _, file := range files {
+		fileURL := *parsedURL
+		fileURL.Path = file
+		if err := downloadSingleFTPFile(&fileURL); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ftpConnect(parsedURL *url.URL) (*textproto.Conn, error) {
+	config := &tls.Config{
+		ServerName:         parsedURL.Hostname(),
+		InsecureSkipVerify: false,
+	}
+
+	var controlConn net.Conn
+	var err error
+
+	switch parsedURL.Scheme {
+	case "ftps":
+		controlConn, err = tls.Dial("tcp", parsedURL.Host+":21", config)
+	default:
+		controlConn, err = net.Dial("tcp", parsedURL.Host+":21")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	tp := textproto.NewConn(controlConn)
+	_, _, err = tp.ReadResponse(220)
+	if err != nil {
+		tp.Close()
+		return nil, fmt.Errorf("FTP connection failed: %v", err)
 	}
 
 	user := ftpUser
@@ -808,86 +906,203 @@ func downloadFTP(parsedURL *url.URL) error {
 		pass = "goget@example.com"
 	}
 
-	tp.PrintfLine("USER %s", user)
-	code, _, _ = tp.ReadResponse(331)
-	if code != 331 && code != 230 {
-		return fmt.Errorf("FTP login failed")
+	id, err := tp.Cmd("USER %s", user)
+	if err != nil {
+		tp.Close()
+		return nil, fmt.Errorf("USER command failed: %v", err)
+	}
+	_, _, err = tp.ReadResponse(int(id))
+	if err != nil {
+		tp.Close()
+		return nil, fmt.Errorf("FTP login failed: %v", err)
 	}
 
-	tp.PrintfLine("PASS %s", pass)
-	code, _, _ = tp.ReadResponse(230)
-	if code != 230 {
-		return fmt.Errorf("FTP authentication failed")
+	id, err = tp.Cmd("PASS %s", pass)
+	if err != nil {
+		tp.Close()
+		return nil, fmt.Errorf("PASS command failed: %v", err)
+	}
+	_, _, err = tp.ReadResponse(int(id))
+	if err != nil {
+		tp.Close()
+		return nil, fmt.Errorf("FTP authentication failed: %v", err)
 	}
 
-	tp.PrintfLine("TYPE I")
-	code, _, _ = tp.ReadResponse(200)
-	if code != 200 {
-		return fmt.Errorf("FTP TYPE I failed")
+	return tp, nil
+}
+
+func listFTPFiles(tp *textproto.Conn, path string) ([]string, error) {
+	dir, pattern := filepath.Split(path)
+	if dir == "" {
+		dir = "."
 	}
 
-	tp.PrintfLine("PASV")
-	code, msg, _ = tp.ReadResponse(227)
-	if code != 227 {
-		return fmt.Errorf("FTP PASV failed")
+	id, err := tp.Cmd("CWD %s", dir)
+	if err != nil {
+		return nil, fmt.Errorf("CWD failed: %v", err)
+	}
+	if _, _, err := tp.ReadResponse(int(id)); err != nil {
+		return nil, fmt.Errorf("CWD failed: %v", err)
 	}
 
-	dataConn, err := parsePASV(msg)
+	id, err = tp.Cmd("NLST")
+	if err != nil {
+		return nil, fmt.Errorf("NLST failed: %v", err)
+	}
+	code, msg, err := tp.ReadResponse(int(id))
+	if err != nil || code != 226 {
+		return nil, fmt.Errorf("NLST failed: %d %s", code, msg)
+	}
+
+	files := strings.Split(strings.TrimSpace(msg), "\n")
+	var matchedFiles []string
+	for _, file := range files {
+		file = strings.TrimSpace(file)
+		if file == "" {
+			continue
+		}
+		if matchWildcard(pattern, filepath.Base(file)) {
+			matchedFiles = append(matchedFiles, filepath.Join(dir, file))
+		}
+	}
+	return matchedFiles, nil
+}
+
+func downloadSingleFTPFile(parsedURL *url.URL) error {
+	tp, err := ftpConnect(parsedURL)
 	if err != nil {
 		return err
 	}
+	defer tp.Close()
 
-	tp.PrintfLine("LIST %s", parsedURL.Path)
-	code, _, _ = tp.ReadResponse(150)
-	if code != 150 {
-		return fmt.Errorf("FTP LIST failed")
+	id, err := tp.Cmd("TYPE I")
+	if err != nil {
+		return fmt.Errorf("TYPE I failed: %v", err)
+	}
+	if _, _, err := tp.ReadResponse(int(id)); err != nil {
+		return fmt.Errorf("TYPE I failed: %v", err)
 	}
 
-	reader := bufio.NewReader(dataConn)
-	scanner := bufio.NewScanner(reader)
-	var files []string
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, "d") {
-			dirName := strings.Fields(line)[8]
-			files = append(files, dirName+"/")
-		} else {
-			fileName := strings.Fields(line)[8]
-			files = append(files, fileName)
+	var dataConn net.Conn
+	if preferIPv6 || parsedURL.Scheme == "ftps" {
+		id, err = tp.Cmd("EPSV")
+		if err != nil {
+			return fmt.Errorf("EPSV failed: %v", err)
 		}
-	}
-
-	dataConn.Close()
-	tp.ReadResponse(226)
-
-	for _, file := range files {
-		fileURL := *parsedURL
-		fileURL.Path = filepath.Join(fileURL.Path, file)
-		err := download(&fileURL, "", maxDepth-1)
+		code, msg, err := tp.ReadResponse(int(id))
+		if err != nil {
+			return fmt.Errorf("EPSV failed: %v", err)
+		}
+		if code != 229 {
+			return fmt.Errorf("EPSV failed: %s", msg)
+		}
+		dataAddr, err := parseEPSV(parsedURL, msg)
 		if err != nil {
 			return err
 		}
+		dataConn, err = tls.Dial("tcp", dataAddr, &tls.Config{InsecureSkipVerify: false})
+	} else {
+		id, err = tp.Cmd("PASV")
+		if err != nil {
+			return fmt.Errorf("PASV failed: %v", err)
+		}
+		code, msg, err := tp.ReadResponse(int(id))
+		if err != nil {
+			return fmt.Errorf("PASV failed: %v", err)
+		}
+		if code != 227 {
+			return fmt.Errorf("PASV failed: %s", msg)
+		}
+		dataAddr, err := parsePASV(msg)
+		if err != nil {
+			return err
+		}
+		dataConn, err = net.Dial("tcp", dataAddr)
+	}
+	if err != nil {
+		return err
+	}
+	defer dataConn.Close()
+
+	id, err = tp.Cmd("RETR %s", parsedURL.Path)
+	if err != nil {
+		return fmt.Errorf("RETR failed: %v", err)
+	}
+	if _, _, err := tp.ReadResponse(150); err != nil {
+		return fmt.Errorf("RETR failed: %v", err)
 	}
 
-	return nil
+	outputPath := generateOutputPath(parsedURL)
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
+		return err
+	}
+
+	file, err := os.Create(outputPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	if _, err := io.Copy(file, dataConn); err != nil {
+		return err
+	}
+
+	_, _, err = tp.ReadResponse(226)
+	return err
 }
 
-func parsePASV(msg string) (net.Conn, error) {
+func parseEPSV(parsedURL *url.URL, msg string) (string, error) {
+	re := regexp.MustCompile(`\|\|\|(\d+)\|`)
+	matches := re.FindStringSubmatch(msg)
+	if len(matches) != 2 {
+		return "", fmt.Errorf("invalid EPSV response")
+	}
+
+	port, _ := strconv.Atoi(matches[1])
+	return fmt.Sprintf("[%s]:%d", parsedURL.Hostname(), port), nil
+}
+
+func parsePASV(msg string) (string, error) {
 	re := regexp.MustCompile(`\((\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\)`)
 	matches := re.FindStringSubmatch(msg)
 	if len(matches) != 7 {
-		return nil, fmt.Errorf("invalid PASV response")
+		return "", fmt.Errorf("invalid PASV response")
 	}
 
 	ip := fmt.Sprintf("%s.%s.%s.%s", matches[1], matches[2], matches[3], matches[4])
 	port := strconv.Itoa(int((atoi(matches[5]) << 8) + atoi(matches[6])))
-	return net.Dial("tcp", ip+":"+port)
+	return fmt.Sprintf("%s:%s", ip, port), nil
 }
 
 func atoi(s string) int {
 	i, _ := strconv.Atoi(s)
 	return i
+}
+
+func matchWildcard(pattern, name string) bool {
+	regexPattern := "^" + strings.ReplaceAll(regexp.QuoteMeta(pattern), "\\*", ".*") + "$"
+	regexPattern = strings.ReplaceAll(regexPattern, "\\?", ".")
+	matched, _ := regexp.MatchString(regexPattern, name)
+	return matched
+}
+
+// --- FTP Wildcard Implementation End ---
+
+func generateOutputPath(parsedURL *url.URL) string {
+	path := parsedURL.Path
+	if path == "" || path == "/" {
+		path = "/index.html"
+	}
+
+	if mirrorMode {
+		host := parsedURL.Hostname()
+		if parsedURL.Port() != "" {
+			host += ":" + parsedURL.Port()
+		}
+		return filepath.Join("downloads", host, path)
+	}
+
+	return filepath.Base(path)
 }
 
 func rewriteLinks(doc *html.Node, baseUrl *url.URL) {

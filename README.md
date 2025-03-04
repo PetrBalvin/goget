@@ -1,58 +1,56 @@
 # goget
 
-[![Go Version](https://img.shields.io/badge/Go-1.20+-blue)](https://go.dev)
+[![Go Version](https://img.shields.io/badge/Go-1.24+-blue)](https://go.dev)
 [![License](https://img.shields.io/badge/License-BSD_3--Clause-green)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-1.1.0-blue)](https://github.com/petrbalvin/goget)
+[![Platform](https://img.shields.io/badge/Platform-Linux%2F%20FreeBSD-lightgrey)](https://github.com/petrbalvin/goget)
+[![Version](https://img.shields.io/badge/Version-1.2.0-blue)](https://github.com/petrbalvin/goget)
 
-**A modern command-line download utility written in Go with IPv6 support and wget-like features**
+**A modern command-line download utility for Linux/FreeBSD with IPv6 support**
 
 ---
 
 ## 📖 Description
-`goget` is a lightweight, cross-platform download tool inspired by `wget`, built with modern Go features. It supports HTTP/HTTPS/FTP/FTPS protocols and offers advanced capabilities like parallel downloads, checksum validation, and recursive mirroring.
+```text
+goget is a minimalist download tool optimized for UNIX-like systems. It supports HTTP/HTTPS/FTP/FTPS protocols
+with parallel transfers, checksum validation, and recursive mirroring. Built with Go's standard library and
+golang.org/x packages for maximum compatibility.
+```
 
 ---
 
 ## 🚀 Features
 
 ### Core Functionality
-- **Multi-protocol support**: HTTP/HTTPS/FTP/FTPS (explicit mode)
-- **IPv6 preference** via `-6` flag
-- **Resume interrupted downloads** (`-c`)
-- **Recursive downloads** with depth control (`-r -l=5`)
-- **Parallel transfers** (`-N=4` for 4 threads)
-- **Mirror mode** with directory structure (`-m`)
+```bash
+# Download file with IPv6 preference
+goget -url https://example.com/file.iso -6
+
+# Resume partial download
+goget -url https://example.com/large.zip -c
+
+# Mirror website (3 levels deep)
+goget -url https://example.com -r -l=3 -m
+```
 
 ### Security & Authentication
-- **HTTP Basic/Digest auth** (`--digest`, `-http-user`, `-http-pass`)
-- **FTP/FTPS authentication** (`-ftp-user`, `-ftp-pass`)
-- **TLS for FTPS** (server verification)
-- **Checksum validation** (`--checksum=md5:...` or `sha1:...`)
+```bash
+# FTPS with TLS encryption
+goget -url ftps://user:pass@files.example.com/secret.txt
 
-### Advanced Control
-- **Extension filtering** (`-A=pdf,zip` / `-R=jpg`)
-- **Domain whitelisting** (`-D=example.com`)
-- **Retry mechanism** (`-tries=3`)
-- **Custom User-Agent** (`-U="MyBot"`)
-- **Proxy support** (`-proxy=http://user:pass@host:port`)
-- **POST requests** (`--post-data="key=value"`)
-
-### Utilities
-- **Cookie persistence** (`--cookies=file.json`)
-- **Link conversion** for offline viewing (`-k`)
-- **Spider mode** (`--spider` for URL checks)
+# HTTP Digest authentication
+goget -url http://secure.example.com --digest -http-user=admin
+```
 
 ---
 
-## 📦 Installation
-
+## 📦 Installation (Linux/FreeBSD)
 ```bash
+# Build from source
 git clone https://github.com/petrbalvin/goget.git
-cd goget
-go build -o goget main.go
-sudo mv goget /usr/local/bin/
+cd goget && go build -o goget main.go
 
-# Verify installation
+# Install system-wide
+sudo mv goget /usr/local/bin/
 goget --version
 ```
 
@@ -60,56 +58,80 @@ goget --version
 
 ## 🛠️ Usage Examples
 
-### Basic File Download
+### Advanced Features
 ```bash
-goget -url https://example.com/large.iso -O disk_image.iso
-```
+# Rate-limited download (2 MB/s)
+goget -url https://example.com/4k.mp4 --limit-rate=2M
 
-### Mirror Website (3 levels deep)
-```bash
-goget -url https://example.com -r -l=3 -m -k
-```
+# FTP wildcard download
+goget -url "ftps://user:pass@example.com/logs/*.gz" -6
 
-### FTP Download with IPv6
-```bash
-goget -url ftp://user:pass@example.com/report.pdf -6
-```
-
-### Validate Checksum
-```bash
-goget -url https://example.com/file.tar.gz --checksum=sha1:2fd4e1c67a2d...
+# Validate SHA1 checksum
+goget -url https://example.com/disk.img --checksum=sha1:2fd4e1c67a2d...
 ```
 
 ---
 
-## 🗺️ Roadmap: v1.2.0
-
-### Planned Features
-| Feature                  | Status                |
-|--------------------------|-----------------------|
-| **Full FTPS Support**    | 🛠️ TLS data channels  |
-| **POST File Upload**     | ✅ `--post-file`       |
-| **Interactive Progress** | 🎨 TUI with metrics   |
-| **MIME-Type Filtering**  | 🔍 Filter by type     |
-| **HTTP/3 Support**       | 🧪 Experimental QUIC  |
-
----
-
-## ⚠️ Known Limitations
-- ❗ **FTPS Data Encryption**: TLS not applied to FTP data transfers
-- ❗ **No SOCKS Proxy**: Only HTTP proxies supported
-- ❗ **Basic UI**: Text-based progress (no ETA/speed stats)
-
----
-
-## 🤝 Contributing
-```bash
-# Clone repo and create a branch
-git clone https://github.com/your-username/goget.git
-cd goget
-git checkout -b feature/awesome-feature
+## 🆕 What's New in 1.2.0
+```text
+- FTP Wildcards: Download multiple files using * and ? patterns
+- Rate Limiter: Control bandwidth with --limit-rate
+- MIME-Type Filter: Validate Content-Type via -mime-type
+- Improved FTPS: Full TLS for control/data channels
 ```
 
+---
+
+## 🗺️ Roadmap: v1.3.0
+```text
+■ SOCKS5 Proxy Support       [In Progress]
+■ Resumable FTP Transfers    [Planned]
+■ SFTP Support               [Planned]
+■ SHA-256/SHA-512 Validation [Planned]
+■ WebDAV Integration         [Research]
+■ ZIP Archive Extraction     [Research]
+
+### Future Proposals:
+▢ **Extended Checksum Algorithms**
+   - BLAKE3/CRC32 integration
+   - Auto-detection based on hash length
+
+▢ **Cloud Storage Enhancements**
+   - Google Cloud Storage support
+   - Presigned URL generation/validation
+
+▢ **RISC-V Architecture Support**
+   - Native builds for RISC-V CPUs
+   - CI/CD testing on RISC-V emulators
+
+▢ **Advanced Protocol Features**
+   - HTTP/3 via QUIC (experimental)
+   - Tor hidden service discovery
+```
+
+---
+
+## ⚠️ Limitations
+```bash
+# Platform support
+Currently only compatible with Linux and FreeBSD
+
+# Experimental Features
+goget -url https://example.com --http3  # Not fully implemented
+```
+
+---
+
+## 🤝 Contributing (UNIX Only)
+```bash
+# Development setup
+git clone https://github.com/petrbalvin/goget.git
+cd goget && go test -v ./...
+```
+
+```text
 1. Fork the repository
-2. Submit PRs to the `dev` branch
-3. Follow [code guidelines](CONTRIBUTING.md)
+2. Test changes on Linux/FreeBSD
+3. Submit PR to 'dev' branch
+
+Licensed under BSD-3-Clause. Optimized for UNIX-like systems.
